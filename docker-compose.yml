@@ -1,0 +1,7 @@
+version: "3.8"
+services:
+  web:
+    build: .
+    ports:
+      - "6060:6060"
+    restart: unless-stopped
