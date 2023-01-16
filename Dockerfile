@@ -1,9 +1,33 @@
-FROM rust:1.48
+# https://github.com/rogertorres/dev.to/blob/main/docker/holodeck/Dockerfile5 
 
-WORKDIR /usr/src/masto_rss
+# Rust as the base image
+FROM rust:1.66 as build
 
-COPY . .
+# Create a new empty shell project
+RUN USER=root cargo new --bin masto_rss
+WORKDIR /masto_rss
 
-RUN cargo install --path .
+# Copy our manifests
+COPY ./Cargo.lock ./Cargo.lock
+COPY ./Cargo.toml ./Cargo.toml
 
-CMD ["masto_rss", "Config.toml"]
+# Build only the dependencies to cache them
+RUN cargo build --release
+RUN rm src/*.rs
+
+# Copy the source code
+COPY ./src ./src
+
+# Build for release.
+RUN rm ./target/release/deps/masto_rss*
+RUN cargo build --release
+
+# The final base image
+FROM rust:1.66
+
+# Copy from the previous build
+COPY --from=build /masto_rss/target/release/masto_rss /usr/src/masto_rss
+COPY ./Config.toml ./Config.toml
+
+# Run the binary
+CMD ["/usr/src/masto_rss", "/Config.toml"]
