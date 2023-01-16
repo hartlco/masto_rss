@@ -72,6 +72,7 @@ fn create_feed(
     .items(post_items)
     .link(mastodon_instance_url)
     // TODO: Get user name from mastodon instance
+    .title("Mastodon Timeline")
     .description("Mastodon Timeline")
     .build()
     .unwrap();
