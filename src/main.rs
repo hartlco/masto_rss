@@ -33,7 +33,16 @@ async fn feed(path: web::Path<(String, String)>) -> HttpResponse {
         Some(access_token),
         None,
     );
-    let res = client.get_home_timeline(Option::None).await.unwrap();
+
+    let options: GetTimelineOptionsWithLocal = GetTimelineOptionsWithLocal {
+        only_media: None,
+        limit: Some(40),
+        max_id: None,
+        since_id: None,
+        min_id: None,
+        local: None,
+    };
+    let res = client.get_home_timeline(Some(&options)).await.unwrap();
     let status = res.json();
 
     return HttpResponse::Ok()
