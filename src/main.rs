@@ -6,13 +6,13 @@ use rss::ChannelBuilder;
 use rss::ItemBuilder;
 use std::env;
 
-use actix_web::{get, App, HttpResponse, HttpServer};
+use actix_web::{get, web, App, HttpResponse, HttpServer};
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port = config_value("port");
 
-    let url = format!("localhost:{}", port);
+    let url = format!("0.0.0.0:{}", port);
     println!("Running on: http://{}", url);
 
     HttpServer::new(|| {
@@ -24,14 +24,15 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
-#[get("/")]
-async fn feed() -> HttpResponse {
-    let access_token = config_value("access_token");
-    let mastodon_instance = config_value("mastodon_instance");
+#[get("/{mastodon_instance}/{access_token}")]
+async fn feed(path: web::Path<(String, String)>) -> HttpResponse {
+    let (mastodon_instance, access_token) = path.into_inner();
+    let full_instance_url = format!("https://{}/", mastodon_instance);
+    let cloned_instace = full_instance_url.clone();
 
     let client = megalodon::generator(
         megalodon::SNS::Mastodon,
-        String::from(mastodon_instance),
+        String::from(full_instance_url),
         Some(access_token),
         None,
     );
@@ -40,10 +41,13 @@ async fn feed() -> HttpResponse {
 
     return HttpResponse::Ok()
     .content_type("application/rss+xml")
-    .body(create_feed(status));
+    .body(create_feed(status, cloned_instace));
 }
 
-fn create_feed(posts: std::vec::Vec<megalodon::entities::Status>) -> String {
+fn create_feed(
+    posts: std::vec::Vec<megalodon::entities::Status>,
+    mastodon_instance_url: String,
+) -> String {
     let mut post_items = Vec::new();
 
     for post in posts {
@@ -68,7 +72,8 @@ fn create_feed(posts: std::vec::Vec<megalodon::entities::Status>) -> String {
     let channel = ChannelBuilder::default()
     .title(config_value("rss_title"))
     .items(post_items)
-    .link(config_value("rss_url"))
+    .link(mastodon_instance_url)
+    // TODO: Get user name from mastodon instance
     .description(config_value("rss_description"))
     .build()
     .unwrap();
