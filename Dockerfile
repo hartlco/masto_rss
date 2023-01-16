@@ -23,11 +23,12 @@ RUN rm ./target/release/deps/masto_rss*
 RUN cargo build --release
 
 # The final base image
-FROM rust:1.66
+FROM rust:1.66-slim-buster
 
 # Copy from the previous build
 COPY --from=build /masto_rss/target/release/masto_rss /usr/src/masto_rss
-COPY ./Config.toml ./Config.toml
 
 # Run the binary
-CMD ["/usr/src/masto_rss", "/Config.toml"]
+CMD ["/usr/src/masto_rss"]
+
+EXPOSE 6060

@@ -4,15 +4,12 @@ extern crate config;
 use megalodon::megalodon::GetTimelineOptionsWithLocal;
 use rss::ChannelBuilder;
 use rss::ItemBuilder;
-use std::env;
 
 use actix_web::{get, web, App, HttpResponse, HttpServer};
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port = config_value("port");
-
-    let url = format!("0.0.0.0:{}", port);
+    let url = format!("0.0.0.0:{}", "6060");
     println!("Running on: http://{}", url);
 
     HttpServer::new(|| {
@@ -47,6 +44,7 @@ async fn feed(path: web::Path<(String, String)>) -> HttpResponse {
 fn create_feed(
     posts: std::vec::Vec<megalodon::entities::Status>,
     mastodon_instance_url: String,
+    // user_name: String
 ) -> String {
     let mut post_items = Vec::new();
 
@@ -70,11 +68,11 @@ fn create_feed(
     }
 
     let channel = ChannelBuilder::default()
-    .title(config_value("rss_title"))
+    // .title(format!("Mastodon Homefeed: {}", user_name))
     .items(post_items)
     .link(mastodon_instance_url)
     // TODO: Get user name from mastodon instance
-    .description(config_value("rss_description"))
+    .description("Mastodon Timeline")
     .build()
     .unwrap();
 
@@ -95,21 +93,4 @@ fn content_for(status: &megalodon::entities::Status) -> String {
     }
 
     return content;
-}
-
-fn config_value(key: &str) -> String {
-    let args: Vec<String> = env::args().collect();
-    let config_name = &args[1];
-
-    let mut settings = config::Config::default();
-    settings.merge(config::File::with_name(config_name)).unwrap();
-    match settings.get_str(key) {
-        Ok(value) => {
-            return value
-        }
-
-        Err(_e) => {
-            panic!("{}", format!("Invalid key {}", key));
-        }
-    }
 }

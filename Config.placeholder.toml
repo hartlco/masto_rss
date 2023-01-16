@@ -1,9 +1,0 @@
-port = "6060"
-
-# Values from Mastodon Instance
-access_token = "<ACCESS_TOKEN>"
-mastodon_instance = "https://<MASTODON_INSTANCE_URL>"
-
-rss_title = "Mastodon Timeline"
-rss_url = "https://mastodon.social"
-rss_description = "Users Mastodon timeline."
