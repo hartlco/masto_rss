@@ -2,3 +2,4 @@
 **/*.rs.bk
 /Config.toml
 .DS_Store
+/.DS_Store
