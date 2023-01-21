@@ -58,7 +58,7 @@ async fn feed(path: web::Path<(String, String)>) -> Result<HttpResponse, UserErr
 
     let client = megalodon::generator(
         megalodon::SNS::Mastodon,
-        String::from(full_instance_url),
+        full_instance_url,
         Some(access_token),
         None,
     );
@@ -99,7 +99,7 @@ fn create_feed(
             .description(content_for(&post))
             .title(post.account.display_name)
             .pub_date(pub_date)
-            .link(post.url.unwrap_or(String::from("")))
+            .link(post.url.unwrap_or_else(|| String::from("")))
             .guid(guid)
             .build()
             .map_err(|_e| InternalError::RSSItemError)?;
@@ -118,11 +118,11 @@ fn create_feed(
     channel
         .write_to(::std::io::sink())
         .map_err(|_e| InternalError::ChannelError)?;
-    return Ok(channel.to_string());
+    Ok(channel.to_string())
 }
 
 fn content_for(status: &megalodon::entities::Status) -> String {
-    let mut content = format!("<p>{}</p>", status.content).to_string();
+    let mut content = format!("<p>{}</p>", status.content);
 
     if let Some(reblog) = &status.reblog {
         content = format!(
@@ -137,5 +137,5 @@ fn content_for(status: &megalodon::entities::Status) -> String {
         content = format!("\n{}<img src=\"{}\">", content, media.preview_url);
     }
 
-    return content;
+    content
 }
