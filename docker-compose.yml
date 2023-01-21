@@ -1,7 +1,7 @@
 version: "3.8"
 services:
   web:
-    build: .
+    image: hartlco/masto_rss:v0.0.2
     ports:
       - "6060:6060"
     restart: unless-stopped
