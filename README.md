@@ -17,7 +17,7 @@ Copy the `docker-compose.yml` and run `docker-compose up -d` from within the fol
 Install the Rust toolchain, clone the repository, `cargo run`. 
 
 ## Fetching Feeds
-Your feed is available at `http://localhost:6060/<MASTODON_INSTANCE>/<ACCESS_TOKEN>
+Your feed is available at `http://localhost:6060/<MASTODON_INSTANCE>/<ACCESS_TOKEN>`
 - MASTODON_INSTANCE: The domain-name of your instance. `mastodon.social` for [https://mastodon.social](https://mastodon.social)
 - ACCESS_TOKEN: Create a read-only Mastodon-App in your Mastdon instance settings. Copy the `access_token`.
 
