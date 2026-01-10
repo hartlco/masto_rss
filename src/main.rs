@@ -1,7 +1,17 @@
 extern crate rss;
 
-use atrium_api::{agent::AtpAgent, app::bsky::feed::get_timeline::Parameters as GetTimelineParameters};
-use atrium_xrpc::reqwest::ReqwestClient;
+use atrium_api::{
+    app::bsky::feed::get_timeline::{
+        Parameters as GetTimelineParameters, ParametersData as GetTimelineParametersData,
+    },
+    client::AtpServiceClient,
+};
+use atrium_xrpc::{
+    HttpClient, XrpcClient,
+    http::{Request, Response},
+    types::AuthorizationToken,
+};
+use atrium_xrpc_client::reqwest::ReqwestClient;
 use chrono::{DateTime, Utc};
 use megalodon::megalodon::GetTimelineOptionsWithLocal;
 use rss::{ChannelBuilder, ItemBuilder};
@@ -30,8 +40,39 @@ enum UserError {
     InvalidInstance,
     #[display(fmt = "Access token is required.")]
     MissingAccessToken,
-    #[display(fmt = "Bluesky handle and app password are required.")]
-    MissingBlueskyCredentials,
+    #[display(fmt = "Bluesky access token is required.")]
+    MissingBlueskyAccessToken,
+}
+
+#[derive(Clone)]
+struct TokenClient {
+    inner: ReqwestClient,
+    token: String,
+}
+
+impl TokenClient {
+    fn new(base_uri: impl AsRef<str>, token: String) -> Self {
+        Self { inner: ReqwestClient::new(base_uri), token }
+    }
+}
+
+impl HttpClient for TokenClient {
+    async fn send_http(
+        &self,
+        request: Request<Vec<u8>>,
+    ) -> Result<Response<Vec<u8>>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        self.inner.send_http(request).await
+    }
+}
+
+impl XrpcClient for TokenClient {
+    fn base_uri(&self) -> String {
+        self.inner.base_uri()
+    }
+
+    async fn authorization_token(&self, _is_refresh: bool) -> Option<AuthorizationToken> {
+        Some(AuthorizationToken::Bearer(self.token.clone()))
+    }
 }
 
 impl error::ResponseError for UserError {
@@ -46,7 +87,7 @@ impl error::ResponseError for UserError {
             UserError::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
             UserError::InvalidInstance
             | UserError::MissingAccessToken
-            | UserError::MissingBlueskyCredentials => StatusCode::BAD_REQUEST,
+            | UserError::MissingBlueskyAccessToken => StatusCode::BAD_REQUEST,
         }
     }
 }
@@ -97,27 +138,25 @@ async fn feed(path: web::Path<(String, String)>) -> Result<HttpResponse, UserErr
         .body(create_feed(status, cloned_instance).map_err(|_e| UserError::InternalError)?));
 }
 
-#[get("/bluesky/{handle}/{app_password}")]
-async fn bluesky_feed(path: web::Path<(String, String)>) -> Result<HttpResponse, UserError> {
-    let (handle, app_password) = path.into_inner();
-    if handle.trim().is_empty() || app_password.trim().is_empty() {
-        return Err(UserError::MissingBlueskyCredentials);
+#[get("/bluesky/{access_token}")]
+async fn bluesky_feed(path: web::Path<String>) -> Result<HttpResponse, UserError> {
+    let access_token = path.into_inner();
+    if access_token.trim().is_empty() {
+        return Err(UserError::MissingBlueskyAccessToken);
     }
 
-    let agent = AtpAgent::new(ReqwestClient::new("https://bsky.social"));
-    agent
-        .login(handle.clone(), app_password)
-        .await
-        .map_err(|_e| UserError::InternalError)?;
+    let client = AtpServiceClient::new(TokenClient::new("https://bsky.social", access_token));
 
-    let timeline = agent
+    let timeline = client
+        .service
         .app
         .bsky
         .feed
-        .get_timeline(GetTimelineParameters {
-            limit: Some(40),
+        .get_timeline(GetTimelineParameters::from(GetTimelineParametersData {
+            algorithm: None,
             cursor: None,
-        })
+            limit: 40u8.try_into().ok(),
+        }))
         .await
         .map_err(|_e| UserError::InternalError)?;
 
@@ -186,15 +225,20 @@ fn bluesky_post_from_feed(
 ) -> Option<BlueskyPost> {
     let record_value = serde_json::to_value(&feed_item.post.record).ok()?;
     let content = bluesky_text_from_record(&record_value).unwrap_or_default();
-    let created_at = bluesky_created_at(&record_value)
-        .or_else(|| bluesky_parse_timestamp(&feed_item.post.indexed_at));
+    let indexed_at = feed_item.post.indexed_at.as_str().to_string();
+    let created_at =
+        bluesky_created_at(&record_value).or_else(|| bluesky_parse_timestamp(&indexed_at));
 
     Some(BlueskyPost {
-        id: feed_item.post.uri.clone(),
-        author_handle: feed_item.post.author.handle.clone(),
-        author_display_name: feed_item.post.author.display_name.clone().unwrap_or_else(|| {
-            feed_item.post.author.handle.clone()
-        }),
+        id: feed_item.post.uri.to_string(),
+        author_handle: feed_item.post.author.handle.to_string(),
+        author_display_name: feed_item
+            .post
+            .author
+            .display_name
+            .as_ref()
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| feed_item.post.author.handle.to_string()),
         content,
         created_at,
     })
@@ -236,17 +280,13 @@ fn create_bluesky_feed(posts: Vec<BlueskyPost>) -> Result<String, InternalError>
         guid.set_value(post.id.clone());
         guid.set_permalink(false);
 
-        let mut item_builder = ItemBuilder::default()
+        let pub_date = post.created_at.map(|created_at| created_at.to_rfc2822());
+        let item = ItemBuilder::default()
             .description(post.content)
             .title(post.author_display_name)
             .link(bluesky_post_link(&post.author_handle, &post.id))
-            .guid(guid);
-
-        if let Some(created_at) = post.created_at {
-            item_builder = item_builder.pub_date(created_at.to_rfc2822());
-        }
-
-        let item = item_builder
+            .guid(guid)
+            .pub_date(pub_date)
             .build()
             .map_err(|_e| InternalError::RSSItemError)?;
 
