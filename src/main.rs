@@ -314,7 +314,9 @@ fn bluesky_post_from_feed(
     feed_item: atrium_api::app::bsky::feed::defs::FeedViewPost,
 ) -> Option<BlueskyPost> {
     let record_value = serde_json::to_value(&feed_item.post.record).ok()?;
-    let content = bluesky_text_from_record(&record_value).unwrap_or_default();
+    let embed_value = serde_json::to_value(&feed_item.post.embed).ok();
+    let reason_value = serde_json::to_value(&feed_item.reason).ok();
+    let content = bluesky_content_from_record(&record_value, embed_value.as_ref(), reason_value.as_ref());
     let indexed_at = feed_item.post.indexed_at.as_str().to_string();
     let created_at =
         bluesky_created_at(&record_value).or_else(|| bluesky_parse_timestamp(&indexed_at));
@@ -335,12 +337,187 @@ fn bluesky_post_from_feed(
 }
 
 fn bluesky_text_from_record(record: &Value) -> Option<String> {
-    record.get("text").and_then(|text| text.as_str()).map(|text| {
-        format!(
-            "<p>{}</p>",
-            text.replace('<', "&lt;").replace('>', "&gt;")
-        )
-    })
+    record
+        .get("text")
+        .and_then(|text| text.as_str())
+        .map(|text| format!("<p>{}</p>", bluesky_escape_html(text)))
+}
+
+fn bluesky_content_from_record(
+    record: &Value,
+    embed: Option<&Value>,
+    reason: Option<&Value>,
+) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(reposter) = bluesky_repost_by(reason) {
+        parts.push(format!("<p><em>Reposted by {}</em></p>", reposter));
+    }
+
+    if let Some(text) = bluesky_text_from_record(record) {
+        parts.push(text);
+    }
+
+    if let Some(embed) = embed {
+        parts.extend(bluesky_embed_html(embed));
+    }
+
+    parts.join("\n")
+}
+
+fn bluesky_embed_html(embed: &Value) -> Vec<String> {
+    let embed_type = embed.get("$type").and_then(|value| value.as_str());
+    match embed_type {
+        Some("app.bsky.embed.images#view") => bluesky_images_html(embed),
+        Some("app.bsky.embed.video#view") => bluesky_video_html(embed),
+        Some("app.bsky.embed.record#view") => bluesky_quote_html(embed).into_iter().collect(),
+        Some("app.bsky.embed.recordWithMedia#view") => {
+            let mut parts = Vec::new();
+            if let Some(record) = embed.get("record") {
+                if let Some(quote) = bluesky_quote_html(record) {
+                    parts.push(quote);
+                }
+            }
+            if let Some(media) = embed.get("media") {
+                parts.extend(bluesky_embed_html(media));
+            }
+            parts
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn bluesky_images_html(embed: &Value) -> Vec<String> {
+    let images = embed.get("images").and_then(|value| value.as_array());
+    images
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let url = item.get("fullsize").and_then(|value| value.as_str())?;
+                    let alt = item
+                        .get("alt")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    Some(format!(
+                        "<p><img src=\"{}\" alt=\"{}\"></p>",
+                        url,
+                        bluesky_escape_html(alt)
+                    ))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn bluesky_video_html(embed: &Value) -> Vec<String> {
+    let playlist = embed
+        .get("playlist")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if playlist.is_empty() {
+        return Vec::new();
+    }
+
+    let alt = embed
+        .get("alt")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Video thumbnail");
+    let thumbnail = embed
+        .get("thumbnail")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+
+    let mut parts = Vec::new();
+    if !thumbnail.is_empty() {
+        parts.push(format!(
+            "<p><a href=\"{}\"><img src=\"{}\" alt=\"{}\"></a></p>",
+            playlist,
+            thumbnail,
+            bluesky_escape_html(alt)
+        ));
+    }
+    parts.push(format!(
+        "<p><a href=\"{}\">Video</a></p>",
+        playlist
+    ));
+    parts
+}
+
+fn bluesky_quote_html(embed: &Value) -> Option<String> {
+    let record = embed.get("record")?;
+    let record_type = record.get("$type")?.as_str()?;
+    if record_type != "app.bsky.embed.record#viewRecord" {
+        return None;
+    }
+
+    let author = record.get("author");
+    let author_name = author
+        .and_then(|value| value.get("displayName"))
+        .and_then(|value| value.as_str())
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            author
+                .and_then(|value| value.get("handle"))
+                .and_then(|value| value.as_str())
+        })
+        .unwrap_or("Unknown");
+
+    let handle = author
+        .and_then(|value| value.get("handle"))
+        .and_then(|value| value.as_str());
+    let text = record
+        .get("value")
+        .and_then(|value| value.get("text"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let uri = record.get("uri").and_then(|value| value.as_str());
+    let link = match (handle, uri) {
+        (Some(handle), Some(uri)) => bluesky_post_link(handle, uri),
+        _ => String::new(),
+    };
+
+    let mut quote = String::new();
+    quote.push_str("<blockquote>");
+    quote.push_str(&format!(
+        "<p><strong>{}</strong></p>",
+        bluesky_escape_html(author_name)
+    ));
+    if !text.trim().is_empty() {
+        quote.push_str(&format!("<p>{}</p>", bluesky_escape_html(text)));
+    }
+    if !link.is_empty() {
+        quote.push_str(&format!("<p><a href=\"{}\">View quoted post</a></p>", link));
+    }
+    quote.push_str("</blockquote>");
+
+    Some(quote)
+}
+
+fn bluesky_repost_by(reason: Option<&Value>) -> Option<String> {
+    let reason = reason?;
+    let reason_type = reason.get("$type").and_then(|value| value.as_str())?;
+    if reason_type != "app.bsky.feed.defs#reasonRepost" {
+        return None;
+    }
+
+    let author = reason.get("by")?;
+    let display_name = author
+        .get("displayName")
+        .and_then(|value| value.as_str())
+        .filter(|name| !name.trim().is_empty());
+    let handle = author.get("handle").and_then(|value| value.as_str());
+
+    display_name
+        .or(handle)
+        .map(|value| bluesky_escape_html(value))
+}
+
+fn bluesky_escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn bluesky_created_at(record: &Value) -> Option<DateTime<Utc>> {
