@@ -1,10 +1,6 @@
 extern crate rss;
 
-use atrium_api::{
-    app::bsky::feed::get_timeline::Parameters as GetTimelineParameters,
-    com::atproto::server::create_session::Input as CreateSessionInput,
-    client::AtpClient,
-};
+use atrium_api::{agent::AtpAgent, app::bsky::feed::get_timeline::Parameters as GetTimelineParameters};
 use atrium_xrpc::reqwest::ReqwestClient;
 use chrono::{DateTime, Utc};
 use megalodon::megalodon::GetTimelineOptionsWithLocal;
@@ -108,23 +104,13 @@ async fn bluesky_feed(path: web::Path<(String, String)>) -> Result<HttpResponse,
         return Err(UserError::MissingBlueskyCredentials);
     }
 
-    let client = AtpClient::new(ReqwestClient::new("https://bsky.social"));
-    let session = client
-        .com
-        .atproto
-        .server
-        .create_session(CreateSessionInput {
-            identifier: handle.clone(),
-            password: app_password,
-        })
+    let agent = AtpAgent::new(ReqwestClient::new("https://bsky.social"));
+    agent
+        .login(handle.clone(), app_password)
         .await
         .map_err(|_e| UserError::InternalError)?;
 
-    let authed_client = AtpClient::new(
-        ReqwestClient::new("https://bsky.social").with_bearer_token(session.data.access_jwt),
-    );
-
-    let timeline = authed_client
+    let timeline = agent
         .app
         .bsky
         .feed
