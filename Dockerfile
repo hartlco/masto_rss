@@ -23,7 +23,11 @@ RUN rm ./target/release/deps/masto_rss*
 RUN cargo build --release
 
 # The final base image
-FROM rust:1.78-slim-buster
+FROM rust:1.78-slim-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libssl3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy from the previous build
 COPY --from=build /masto_rss/target/release/masto_rss /usr/src/masto_rss
