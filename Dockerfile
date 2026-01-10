@@ -1,7 +1,7 @@
 # https://github.com/rogertorres/dev.to/blob/main/docker/holodeck/Dockerfile5 
 
 # Rust as the base image
-FROM rust:1.66 as build
+FROM rust:1.74 as build
 
 # Create a new empty shell project
 RUN USER=root cargo new --bin masto_rss
@@ -23,7 +23,7 @@ RUN rm ./target/release/deps/masto_rss*
 RUN cargo build --release
 
 # The final base image
-FROM rust:1.66-slim-buster
+FROM rust:1.74-slim-buster
 
 # Copy from the previous build
 COPY --from=build /masto_rss/target/release/masto_rss /usr/src/masto_rss
