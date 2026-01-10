@@ -1,8 +1,15 @@
 extern crate rss;
 
+use atrium_api::{
+    app::bsky::feed::get_timeline::Parameters as GetTimelineParameters,
+    com::atproto::server::create_session::Input as CreateSessionInput,
+    client::AtpClient,
+};
+use atrium_xrpc::reqwest::ReqwestClient;
+use chrono::{DateTime, Utc};
 use megalodon::megalodon::GetTimelineOptionsWithLocal;
-use rss::ChannelBuilder;
-use rss::ItemBuilder;
+use rss::{ChannelBuilder, ItemBuilder};
+use serde_json::Value;
 
 use actix_web::{
     error, get,
@@ -27,6 +34,8 @@ enum UserError {
     InvalidInstance,
     #[display(fmt = "Access token is required.")]
     MissingAccessToken,
+    #[display(fmt = "Bluesky handle and app password are required.")]
+    MissingBlueskyCredentials,
 }
 
 impl error::ResponseError for UserError {
@@ -39,7 +48,9 @@ impl error::ResponseError for UserError {
     fn status_code(&self) -> StatusCode {
         match *self {
             UserError::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
-            UserError::InvalidInstance | UserError::MissingAccessToken => StatusCode::BAD_REQUEST,
+            UserError::InvalidInstance
+            | UserError::MissingAccessToken
+            | UserError::MissingBlueskyCredentials => StatusCode::BAD_REQUEST,
         }
     }
 }
@@ -49,7 +60,7 @@ async fn main() -> std::io::Result<()> {
     let url = format!("0.0.0.0:{}", port_from_env());
     println!("Running on: http://{}", url);
 
-    HttpServer::new(|| App::new().service(feed))
+    HttpServer::new(|| App::new().service(feed).service(bluesky_feed))
         .bind(url)?
         .run()
         .await
@@ -90,6 +101,52 @@ async fn feed(path: web::Path<(String, String)>) -> Result<HttpResponse, UserErr
         .body(create_feed(status, cloned_instance).map_err(|_e| UserError::InternalError)?));
 }
 
+#[get("/bluesky/{handle}/{app_password}")]
+async fn bluesky_feed(path: web::Path<(String, String)>) -> Result<HttpResponse, UserError> {
+    let (handle, app_password) = path.into_inner();
+    if handle.trim().is_empty() || app_password.trim().is_empty() {
+        return Err(UserError::MissingBlueskyCredentials);
+    }
+
+    let client = AtpClient::new(ReqwestClient::new("https://bsky.social"));
+    let session = client
+        .com
+        .atproto
+        .server
+        .create_session(CreateSessionInput {
+            identifier: handle.clone(),
+            password: app_password,
+        })
+        .await
+        .map_err(|_e| UserError::InternalError)?;
+
+    let authed_client = AtpClient::new(
+        ReqwestClient::new("https://bsky.social").with_bearer_token(session.data.access_jwt),
+    );
+
+    let timeline = authed_client
+        .app
+        .bsky
+        .feed
+        .get_timeline(GetTimelineParameters {
+            limit: Some(40),
+            cursor: None,
+        })
+        .await
+        .map_err(|_e| UserError::InternalError)?;
+
+    let posts = timeline
+        .data
+        .feed
+        .into_iter()
+        .filter_map(bluesky_post_from_feed)
+        .collect::<Vec<_>>();
+
+    Ok(HttpResponse::Ok()
+        .content_type("application/rss+xml")
+        .body(create_bluesky_feed(posts).map_err(|_e| UserError::InternalError)?))
+}
+
 fn create_feed(
     posts: std::vec::Vec<megalodon::entities::Status>,
     mastodon_instance_url: String,
@@ -120,6 +177,101 @@ fn create_feed(
         .link(mastodon_instance_url)
         .title("Mastodon Timeline")
         .description("Mastodon Timeline")
+        .build()
+        .map_err(|_e| InternalError::ChannelError)?;
+
+    channel
+        .write_to(::std::io::sink())
+        .map_err(|_e| InternalError::ChannelError)?;
+    Ok(channel.to_string())
+}
+
+#[derive(Debug, Clone)]
+struct BlueskyPost {
+    id: String,
+    author_handle: String,
+    author_display_name: String,
+    content: String,
+    created_at: Option<DateTime<Utc>>,
+}
+
+fn bluesky_post_from_feed(
+    feed_item: atrium_api::app::bsky::feed::defs::FeedViewPost,
+) -> Option<BlueskyPost> {
+    let record_value = serde_json::to_value(&feed_item.post.record).ok()?;
+    let content = bluesky_text_from_record(&record_value).unwrap_or_default();
+    let created_at = bluesky_created_at(&record_value)
+        .or_else(|| bluesky_parse_timestamp(&feed_item.post.indexed_at));
+
+    Some(BlueskyPost {
+        id: feed_item.post.uri.clone(),
+        author_handle: feed_item.post.author.handle.clone(),
+        author_display_name: feed_item.post.author.display_name.clone().unwrap_or_else(|| {
+            feed_item.post.author.handle.clone()
+        }),
+        content,
+        created_at,
+    })
+}
+
+fn bluesky_text_from_record(record: &Value) -> Option<String> {
+    record.get("text").and_then(|text| text.as_str()).map(|text| {
+        format!(
+            "<p>{}</p>",
+            text.replace('<', "&lt;").replace('>', "&gt;")
+        )
+    })
+}
+
+fn bluesky_created_at(record: &Value) -> Option<DateTime<Utc>> {
+    record
+        .get("createdAt")
+        .or_else(|| record.get("created_at"))
+        .and_then(|value| value.as_str())
+        .and_then(bluesky_parse_timestamp)
+}
+
+fn bluesky_parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn bluesky_post_link(handle: &str, uri: &str) -> String {
+    let rkey = uri.split('/').last().unwrap_or_default();
+    format!("https://bsky.app/profile/{}/post/{}", handle, rkey)
+}
+
+fn create_bluesky_feed(posts: Vec<BlueskyPost>) -> Result<String, InternalError> {
+    let mut post_items = Vec::new();
+
+    for post in posts {
+        let mut guid = rss::Guid::default();
+        guid.set_value(post.id.clone());
+        guid.set_permalink(false);
+
+        let mut item_builder = ItemBuilder::default()
+            .description(post.content)
+            .title(post.author_display_name)
+            .link(bluesky_post_link(&post.author_handle, &post.id))
+            .guid(guid);
+
+        if let Some(created_at) = post.created_at {
+            item_builder = item_builder.pub_date(created_at.to_rfc2822());
+        }
+
+        let item = item_builder
+            .build()
+            .map_err(|_e| InternalError::RSSItemError)?;
+
+        post_items.push(item);
+    }
+
+    let channel = ChannelBuilder::default()
+        .items(post_items)
+        .link("https://bsky.app")
+        .title("Bluesky Timeline")
+        .description("Bluesky Timeline")
         .build()
         .map_err(|_e| InternalError::ChannelError)?;
 
@@ -325,5 +477,23 @@ mod tests {
         assert!(validate_mastodon_instance("bad/host").is_err());
         assert!(validate_mastodon_instance("").is_err());
         assert!(validate_mastodon_instance("-bad.example").is_err());
+    }
+
+    #[test]
+    fn bluesky_post_link_builds_expected_url() {
+        let link = bluesky_post_link("user.bsky.social", "at://did:plc:123/app.bsky.feed.post/abc");
+        assert_eq!(
+            link,
+            "https://bsky.app/profile/user.bsky.social/post/abc"
+        );
+    }
+
+    #[test]
+    fn bluesky_created_at_parses_record_timestamp() {
+        let record = serde_json::json!({
+            "createdAt": "2023-01-01T12:34:56Z"
+        });
+        let parsed = bluesky_created_at(&record).unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2023-01-01T12:34:56+00:00");
     }
 }
