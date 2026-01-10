@@ -4,15 +4,11 @@ use atrium_api::{
     app::bsky::feed::get_timeline::{
         Parameters as GetTimelineParameters, ParametersData as GetTimelineParametersData,
     },
-    client::AtpServiceClient,
-};
-use atrium_xrpc::{
-    HttpClient, XrpcClient,
-    http::{Request, Response},
-    types::AuthorizationToken,
+    agent::atp_agent::{store::MemorySessionStore, AtpAgent},
 };
 use atrium_xrpc_client::reqwest::ReqwestClient;
 use chrono::{DateTime, Utc};
+use dotenvy::dotenv;
 use reqwest::Client;
 use rss::{ChannelBuilder, ItemBuilder};
 use serde::Deserialize;
@@ -25,6 +21,7 @@ use actix_web::{
 };
 use derive_more::{Display, Error};
 use std::env;
+use std::io;
 
 #[derive(Debug, Display, Error)]
 enum InternalError {
@@ -43,39 +40,8 @@ enum UserError {
     MissingAccessToken,
     #[display(fmt = "Mastodon API error: {message}")]
     MastodonApiError { message: String },
-    #[display(fmt = "Bluesky access token is required.")]
-    MissingBlueskyAccessToken,
-}
-
-#[derive(Clone)]
-struct TokenClient {
-    inner: ReqwestClient,
-    token: String,
-}
-
-impl TokenClient {
-    fn new(base_uri: impl AsRef<str>, token: String) -> Self {
-        Self { inner: ReqwestClient::new(base_uri), token }
-    }
-}
-
-impl HttpClient for TokenClient {
-    async fn send_http(
-        &self,
-        request: Request<Vec<u8>>,
-    ) -> Result<Response<Vec<u8>>, Box<dyn std::error::Error + Send + Sync + 'static>> {
-        self.inner.send_http(request).await
-    }
-}
-
-impl XrpcClient for TokenClient {
-    fn base_uri(&self) -> String {
-        self.inner.base_uri()
-    }
-
-    async fn authorization_token(&self, _is_refresh: bool) -> Option<AuthorizationToken> {
-        Some(AuthorizationToken::Bearer(self.token.clone()))
-    }
+    #[display(fmt = "Bluesky credentials are required.")]
+    MissingBlueskyCredentials,
 }
 
 impl error::ResponseError for UserError {
@@ -91,13 +57,21 @@ impl error::ResponseError for UserError {
             UserError::InvalidInstance
             | UserError::MissingAccessToken
             | UserError::MastodonApiError { .. }
-            | UserError::MissingBlueskyAccessToken => StatusCode::BAD_REQUEST,
+            | UserError::MissingBlueskyCredentials => StatusCode::BAD_REQUEST,
         }
     }
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    dotenv().ok();
+    if let Err(error) = bluesky_credentials() {
+        eprintln!("{error}");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Missing Bluesky credentials",
+        ));
+    }
     let url = format!("0.0.0.0:{}", port_from_env());
     println!("Running on: http://{}", url);
 
@@ -126,17 +100,21 @@ async fn feed(path: web::Path<(String, String)>) -> Result<HttpResponse, UserErr
         })?));
 }
 
-#[get("/bluesky/{access_token}")]
-async fn bluesky_feed(path: web::Path<String>) -> Result<HttpResponse, UserError> {
-    let access_token = path.into_inner();
-    if access_token.trim().is_empty() {
-        return Err(UserError::MissingBlueskyAccessToken);
-    }
+#[get("/bluesky")]
+async fn bluesky_feed() -> Result<HttpResponse, UserError> {
+    let (identifier, password) = bluesky_credentials()?;
 
-    let client = AtpServiceClient::new(TokenClient::new("https://bsky.social", access_token));
+    let agent = AtpAgent::new(
+        ReqwestClient::new("https://bsky.social"),
+        MemorySessionStore::default(),
+    );
+    agent.login(&identifier, &password).await.map_err(|e| {
+        eprintln!("Failed to login to Bluesky: {e}");
+        UserError::InternalError
+    })?;
 
-    let timeline = client
-        .service
+    let timeline = agent
+        .api
         .app
         .bsky
         .feed
@@ -164,6 +142,16 @@ async fn bluesky_feed(path: web::Path<String>) -> Result<HttpResponse, UserError
             eprintln!("Failed to build Bluesky RSS feed: {e}");
             UserError::InternalError
         })?))
+}
+
+fn bluesky_credentials() -> Result<(String, String), UserError> {
+    let identifier = env::var("BLUESKY_IDENTIFIER").unwrap_or_default();
+    let password = env::var("BLUESKY_PASSWORD").unwrap_or_default();
+    if identifier.trim().is_empty() || password.trim().is_empty() {
+        return Err(UserError::MissingBlueskyCredentials);
+    }
+
+    Ok((identifier, password))
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

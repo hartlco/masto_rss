@@ -28,6 +28,10 @@ FROM rust:1.78-slim-buster
 # Copy from the previous build
 COPY --from=build /masto_rss/target/release/masto_rss /usr/src/masto_rss
 
+# Environment variables can be supplied via --env-file or docker-compose env_file.
+ENV BLUESKY_IDENTIFIER="" \
+    BLUESKY_PASSWORD=""
+
 # Run the binary
 CMD ["/usr/src/masto_rss"]
 
