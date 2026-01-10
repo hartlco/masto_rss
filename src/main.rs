@@ -13,8 +13,9 @@ use atrium_xrpc::{
 };
 use atrium_xrpc_client::reqwest::ReqwestClient;
 use chrono::{DateTime, Utc};
-use megalodon::megalodon::GetTimelineOptionsWithLocal;
+use reqwest::Client;
 use rss::{ChannelBuilder, ItemBuilder};
+use serde::Deserialize;
 use serde_json::Value;
 
 use actix_web::{
@@ -32,7 +33,7 @@ enum InternalError {
     ChannelError,
 }
 
-#[derive(Debug, Display, Error)]
+#[derive(Debug, Display)]
 enum UserError {
     #[display(fmt = "An internal error occurred. Please try again later.")]
     InternalError,
@@ -40,6 +41,8 @@ enum UserError {
     InvalidInstance,
     #[display(fmt = "Access token is required.")]
     MissingAccessToken,
+    #[display(fmt = "Mastodon API error: {message}")]
+    MastodonApiError { message: String },
     #[display(fmt = "Bluesky access token is required.")]
     MissingBlueskyAccessToken,
 }
@@ -87,6 +90,7 @@ impl error::ResponseError for UserError {
             UserError::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
             UserError::InvalidInstance
             | UserError::MissingAccessToken
+            | UserError::MastodonApiError { .. }
             | UserError::MissingBlueskyAccessToken => StatusCode::BAD_REQUEST,
         }
     }
@@ -112,30 +116,14 @@ async fn feed(path: web::Path<(String, String)>) -> Result<HttpResponse, UserErr
     }
     let cloned_instance = full_instance_url.clone();
 
-    let client = megalodon::generator(
-        megalodon::SNS::Mastodon,
-        full_instance_url,
-        Some(access_token),
-        None,
-    );
-
-    let options: GetTimelineOptionsWithLocal = GetTimelineOptionsWithLocal {
-        only_media: None,
-        limit: Some(40),
-        max_id: None,
-        since_id: None,
-        min_id: None,
-        local: None,
-    };
-    let res = client
-        .get_home_timeline(Some(&options))
-        .await
-        .map_err(|_e| UserError::InternalError)?;
-    let status = res.json();
+    let posts = fetch_mastodon_timeline(&full_instance_url, &access_token).await?;
 
     return Ok(HttpResponse::Ok()
         .content_type("application/rss+xml")
-        .body(create_feed(status, cloned_instance).map_err(|_e| UserError::InternalError)?));
+        .body(create_feed(posts, cloned_instance).map_err(|e| {
+            eprintln!("Failed to build Mastodon RSS feed: {e}");
+            UserError::InternalError
+        })?));
 }
 
 #[get("/bluesky/{access_token}")]
@@ -158,7 +146,10 @@ async fn bluesky_feed(path: web::Path<String>) -> Result<HttpResponse, UserError
             limit: 40u8.try_into().ok(),
         }))
         .await
-        .map_err(|_e| UserError::InternalError)?;
+        .map_err(|e| {
+            eprintln!("Failed to fetch Bluesky timeline: {e}");
+            UserError::InternalError
+        })?;
 
     let posts = timeline
         .data
@@ -169,11 +160,108 @@ async fn bluesky_feed(path: web::Path<String>) -> Result<HttpResponse, UserError
 
     Ok(HttpResponse::Ok()
         .content_type("application/rss+xml")
-        .body(create_bluesky_feed(posts).map_err(|_e| UserError::InternalError)?))
+        .body(create_bluesky_feed(posts).map_err(|e| {
+            eprintln!("Failed to build Bluesky RSS feed: {e}");
+            UserError::InternalError
+        })?))
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct MastodonAccount {
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    username: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MastodonAttachment {
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    preview_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MastodonStatus {
+    id: String,
+    uri: String,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    account: MastodonAccount,
+    #[serde(default)]
+    content: String,
+    created_at: String,
+    #[serde(default)]
+    reblog: Option<Box<MastodonStatus>>,
+    #[serde(default)]
+    media_attachments: Vec<MastodonAttachment>,
+}
+
+async fn fetch_mastodon_timeline(
+    instance_url: &str,
+    access_token: &str,
+) -> Result<Vec<MastodonStatus>, UserError> {
+    let url = format!("{}api/v1/timelines/home", instance_url);
+    let client = Client::new();
+    let response = client
+        .get(&url)
+        .bearer_auth(access_token)
+        .query(&[("limit", "40")])
+        .send()
+        .await
+        .map_err(|e| {
+            eprintln!("Failed to fetch Mastodon timeline: {e}");
+            UserError::InternalError
+        })?;
+
+    let status = response.status();
+    let body = response.text().await.map_err(|e| {
+        eprintln!("Failed to read Mastodon timeline response: {e}");
+        UserError::InternalError
+    })?;
+
+    if !status.is_success() {
+        let message = mastodon_error_message(&body)
+            .unwrap_or_else(|| format!("HTTP {} from Mastodon API.", status.as_u16()));
+        eprintln!("Mastodon API returned error status {}: {}", status, message);
+        return Err(UserError::MastodonApiError { message });
+    }
+
+    match serde_json::from_str::<Vec<MastodonStatus>>(&body) {
+        Ok(posts) => Ok(posts),
+        Err(err) => {
+            if let Some(message) = mastodon_error_message(&body) {
+                eprintln!("Mastodon API error payload: {}", message);
+                return Err(UserError::MastodonApiError { message });
+            }
+
+            let preview = body.chars().take(500).collect::<String>();
+            eprintln!("Failed to decode Mastodon timeline: {err}. Body preview: {preview}");
+            Err(UserError::MastodonApiError {
+                message: "Unexpected response from Mastodon API.".to_string(),
+            })
+        }
+    }
+}
+
+fn mastodon_error_message(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error").and_then(|val| val.as_str());
+    let description = value
+        .get("error_description")
+        .and_then(|val| val.as_str());
+    let message = value.get("message").and_then(|val| val.as_str());
+
+    error
+        .or(description)
+        .or(message)
+        .map(|text| text.to_string())
 }
 
 fn create_feed(
-    posts: std::vec::Vec<megalodon::entities::Status>,
+    posts: std::vec::Vec<MastodonStatus>,
     mastodon_instance_url: String,
 ) -> Result<String, InternalError> {
     let mut post_items = Vec::new();
@@ -183,16 +271,24 @@ fn create_feed(
         guid.set_value(post.id.to_string());
         guid.set_permalink(false);
 
-        let pub_date = post.created_at.to_rfc2822();
+        let pub_date = mastodon_pub_date(&post.created_at);
+        let display_name = if post.account.display_name.trim().is_empty() {
+            post.account.username.clone()
+        } else {
+            post.account.display_name.clone()
+        };
 
         let item = ItemBuilder::default()
             .description(content_for(&post))
-            .title(post.account.display_name)
+            .title(display_name)
             .pub_date(pub_date)
             .link(post.url.clone().unwrap_or_else(|| post.uri.clone()))
             .guid(guid)
             .build()
-            .map_err(|_e| InternalError::RSSItemError)?;
+            .map_err(|e| {
+                eprintln!("Failed to build Mastodon RSS item: {e}");
+                InternalError::RSSItemError
+            })?;
 
         post_items.push(item);
     }
@@ -203,11 +299,17 @@ fn create_feed(
         .title("Mastodon Timeline")
         .description("Mastodon Timeline")
         .build()
-        .map_err(|_e| InternalError::ChannelError)?;
+        .map_err(|e| {
+            eprintln!("Failed to build Mastodon RSS channel: {e}");
+            InternalError::ChannelError
+        })?;
 
     channel
         .write_to(::std::io::sink())
-        .map_err(|_e| InternalError::ChannelError)?;
+        .map_err(|e| {
+            eprintln!("Failed to serialize Mastodon RSS channel: {e}");
+            InternalError::ChannelError
+        })?;
     Ok(channel.to_string())
 }
 
@@ -288,7 +390,10 @@ fn create_bluesky_feed(posts: Vec<BlueskyPost>) -> Result<String, InternalError>
             .guid(guid)
             .pub_date(pub_date)
             .build()
-            .map_err(|_e| InternalError::RSSItemError)?;
+            .map_err(|e| {
+                eprintln!("Failed to build Bluesky RSS item: {e}");
+                InternalError::RSSItemError
+            })?;
 
         post_items.push(item);
     }
@@ -299,15 +404,21 @@ fn create_bluesky_feed(posts: Vec<BlueskyPost>) -> Result<String, InternalError>
         .title("Bluesky Timeline")
         .description("Bluesky Timeline")
         .build()
-        .map_err(|_e| InternalError::ChannelError)?;
+        .map_err(|e| {
+            eprintln!("Failed to build Bluesky RSS channel: {e}");
+            InternalError::ChannelError
+        })?;
 
     channel
         .write_to(::std::io::sink())
-        .map_err(|_e| InternalError::ChannelError)?;
+        .map_err(|e| {
+            eprintln!("Failed to serialize Bluesky RSS channel: {e}");
+            InternalError::ChannelError
+        })?;
     Ok(channel.to_string())
 }
 
-fn content_for(status: &megalodon::entities::Status) -> String {
+fn content_for(status: &MastodonStatus) -> String {
     let mut content = format!("<p>{}</p>", status.content);
 
     if let Some(reblog) = &status.reblog {
@@ -332,6 +443,12 @@ fn content_for(status: &megalodon::entities::Status) -> String {
     }
 
     content
+}
+
+fn mastodon_pub_date(value: &str) -> Option<String> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.to_rfc2822())
 }
 
 fn port_from_env() -> u16 {
@@ -385,80 +502,34 @@ fn validate_mastodon_instance(instance: &str) -> Result<String, UserError> {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use megalodon::entities::{attachment::AttachmentType, Account, Attachment, Status, StatusVisibility};
 
-    fn test_account() -> Account {
-        Account {
-            id: "1".into(),
-            username: "user".into(),
-            acct: "user".into(),
+    fn test_account() -> MastodonAccount {
+        MastodonAccount {
             display_name: "Display Name".into(),
-            locked: false,
-            created_at: Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap(),
-            followers_count: 0,
-            following_count: 0,
-            statuses_count: 0,
-            note: String::new(),
-            url: "https://example.com/@user".into(),
-            avatar: String::new(),
-            avatar_static: String::new(),
-            header: String::new(),
-            header_static: String::new(),
-            emojis: Vec::new(),
-            moved: None,
-            fields: None,
-            bot: None,
-            source: None,
+            username: "user".into(),
         }
     }
 
-    fn test_attachment(preview_url: &str, description: Option<&str>) -> Attachment {
-        Attachment {
-            id: "att-1".into(),
-            r#type: AttachmentType::Image,
-            url: preview_url.into(),
-            remote_url: None,
+    fn test_attachment(preview_url: &str, description: Option<&str>) -> MastodonAttachment {
+        MastodonAttachment {
             preview_url: preview_url.into(),
-            text_url: None,
-            meta: None,
             description: description.map(|value| value.to_string()),
-            blurhash: None,
         }
     }
 
-    fn test_status(content: &str) -> Status {
-        Status {
+    fn test_status(content: &str) -> MastodonStatus {
+        MastodonStatus {
             id: "status-1".into(),
             uri: "https://example.com/status/1".into(),
             url: Some("https://example.com/@user/1".into()),
             account: test_account(),
-            in_reply_to_id: None,
-            in_reply_to_account_id: None,
-            reblog: None,
             content: content.into(),
-            plain_content: None,
-            created_at: Utc.with_ymd_and_hms(2021, 1, 1, 12, 0, 0).unwrap(),
-            emojis: Vec::new(),
-            replies_count: 0,
-            reblogs_count: 0,
-            favourites_count: 0,
-            reblogged: None,
-            favourited: None,
-            muted: None,
-            sensitive: false,
-            spoiler_text: String::new(),
-            visibility: StatusVisibility::Public,
+            created_at: Utc
+                .with_ymd_and_hms(2021, 1, 1, 12, 0, 0)
+                .unwrap()
+                .to_rfc3339(),
+            reblog: None,
             media_attachments: Vec::new(),
-            mentions: Vec::new(),
-            tags: Vec::new(),
-            card: None,
-            poll: None,
-            application: None,
-            language: None,
-            pinned: None,
-            emoji_reactions: None,
-            quote: false,
-            bookmarked: None,
         }
     }
 

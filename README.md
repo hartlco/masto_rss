@@ -21,5 +21,8 @@ Your feed is available at `http://localhost:6060/<MASTODON_INSTANCE>/<ACCESS_TOK
 - MASTODON_INSTANCE: The domain-name of your instance. `mastodon.social` for [https://mastodon.social](https://mastodon.social)
 - ACCESS_TOKEN: Create a read-only Mastodon-App in your Mastdon instance settings. Copy the `access_token`.
 
+For Bluesky, use `http://localhost:6060/bluesky/<BLUESKY_ACCESS_TOKEN>`
+- BLUESKY_ACCESS_TOKEN: Your Bluesky access token.
+
 ## License
 The MIT License (MIT)
