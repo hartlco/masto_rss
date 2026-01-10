@@ -10,9 +10,11 @@ use atrium_xrpc_client::reqwest::ReqwestClient;
 use chrono::{DateTime, Utc};
 use dotenvy::dotenv;
 use reqwest::Client;
-use rss::{ChannelBuilder, ItemBuilder};
+use rss::{ChannelBuilder, Enclosure, ItemBuilder};
+use rss::extension::{Extension, ExtensionMap};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 
 use actix_web::{
     error, get,
@@ -308,6 +310,8 @@ struct BlueskyPost {
     author_display_name: String,
     content: String,
     created_at: Option<DateTime<Utc>>,
+    enclosure: Option<Enclosure>,
+    media_thumbnail: Option<String>,
 }
 
 fn bluesky_post_from_feed(
@@ -317,6 +321,8 @@ fn bluesky_post_from_feed(
     let embed_value = serde_json::to_value(&feed_item.post.embed).ok();
     let reason_value = serde_json::to_value(&feed_item.reason).ok();
     let content = bluesky_content_from_record(&record_value, embed_value.as_ref(), reason_value.as_ref());
+    let enclosure = bluesky_enclosure_from_embed(embed_value.as_ref());
+    let media_thumbnail = bluesky_media_thumbnail_from_embed(embed_value.as_ref());
     let indexed_at = feed_item.post.indexed_at.as_str().to_string();
     let created_at =
         bluesky_created_at(&record_value).or_else(|| bluesky_parse_timestamp(&indexed_at));
@@ -333,6 +339,8 @@ fn bluesky_post_from_feed(
             .unwrap_or_else(|| feed_item.post.author.handle.to_string()),
         content,
         created_at,
+        enclosure,
+        media_thumbnail,
     })
 }
 
@@ -384,6 +392,83 @@ fn bluesky_embed_html(embed: &Value) -> Vec<String> {
             parts
         }
         _ => Vec::new(),
+    }
+}
+
+fn bluesky_enclosure_from_embed(embed: Option<&Value>) -> Option<Enclosure> {
+    let embed = embed?;
+    let embed_type = embed.get("$type").and_then(|value| value.as_str())?;
+    match embed_type {
+        "app.bsky.embed.images#view" => {
+            let first = embed.get("images").and_then(|value| value.as_array())?.first()?;
+            let url = first
+                .get("thumb")
+                .or_else(|| first.get("fullsize"))
+                .and_then(|value| value.as_str())?;
+            Some(bluesky_image_enclosure(url))
+        }
+        "app.bsky.embed.video#view" => {
+            let thumbnail = embed.get("thumbnail").and_then(|value| value.as_str())?;
+            Some(bluesky_image_enclosure(thumbnail))
+        }
+        "app.bsky.embed.recordWithMedia#view" => {
+            let media = embed.get("media")?;
+            bluesky_enclosure_from_embed(Some(media))
+        }
+        _ => None,
+    }
+}
+
+fn bluesky_media_thumbnail_from_embed(embed: Option<&Value>) -> Option<String> {
+    let embed = embed?;
+    let embed_type = embed.get("$type").and_then(|value| value.as_str())?;
+    match embed_type {
+        "app.bsky.embed.images#view" => {
+            let first = embed.get("images").and_then(|value| value.as_array())?.first()?;
+            first
+                .get("thumb")
+                .or_else(|| first.get("fullsize"))
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+        }
+        "app.bsky.embed.video#view" => embed
+            .get("thumbnail")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string()),
+        "app.bsky.embed.recordWithMedia#view" => {
+            let media = embed.get("media")?;
+            bluesky_media_thumbnail_from_embed(Some(media))
+        }
+        _ => None,
+    }
+}
+
+fn bluesky_media_extensions(url: &str) -> ExtensionMap {
+    let mut attrs = HashMap::new();
+    attrs.insert("url".to_string(), url.to_string());
+    attrs.insert("medium".to_string(), "image".to_string());
+    attrs.insert("type".to_string(), "image/jpeg".to_string());
+
+    let extension = Extension {
+        name: "media:content".to_string(),
+        value: None,
+        attrs,
+        children: HashMap::new(),
+    };
+
+    let mut media_map = HashMap::new();
+    media_map.insert("media:content".to_string(), vec![extension]);
+
+    let mut extensions = ExtensionMap::default();
+    extensions.insert("media".to_string(), media_map);
+    extensions
+}
+
+fn bluesky_image_enclosure(url: &str) -> Enclosure {
+    Enclosure {
+        url: url.to_string(),
+        length: "0".to_string(),
+        mime_type: "image/jpeg".to_string(),
     }
 }
 
@@ -548,22 +633,27 @@ fn create_bluesky_feed(posts: Vec<BlueskyPost>) -> Result<String, InternalError>
         guid.set_permalink(false);
 
         let pub_date = post.created_at.map(|created_at| created_at.to_rfc2822());
-        let item = ItemBuilder::default()
+        let mut item = ItemBuilder::default()
             .description(post.content)
             .title(post.author_display_name)
             .link(bluesky_post_link(&post.author_handle, &post.id))
             .guid(guid)
             .pub_date(pub_date)
+            .enclosure(post.enclosure.clone())
             .build()
             .map_err(|e| {
                 eprintln!("Failed to build Bluesky RSS item: {e}");
                 InternalError::RSSItemError
             })?;
 
+        if let Some(thumbnail) = post.media_thumbnail.as_deref() {
+            item.set_extensions(bluesky_media_extensions(thumbnail));
+        }
+
         post_items.push(item);
     }
 
-    let channel = ChannelBuilder::default()
+    let mut channel = ChannelBuilder::default()
         .items(post_items)
         .link("https://bsky.app")
         .title("Bluesky Timeline")
@@ -573,6 +663,13 @@ fn create_bluesky_feed(posts: Vec<BlueskyPost>) -> Result<String, InternalError>
             eprintln!("Failed to build Bluesky RSS channel: {e}");
             InternalError::ChannelError
         })?;
+
+    let mut namespaces = HashMap::new();
+    namespaces.insert(
+        "media".to_string(),
+        "http://search.yahoo.com/mrss/".to_string(),
+    );
+    channel.set_namespaces(namespaces);
 
     channel
         .write_to(::std::io::sink())
