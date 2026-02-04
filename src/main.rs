@@ -169,7 +169,7 @@ struct MastodonAttachment {
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
-    preview_url: String,
+    preview_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -693,15 +693,17 @@ fn content_for(status: &MastodonStatus) -> String {
     }
 
     for media in &status.media_attachments {
-        let alt_text = media
-            .description
-            .as_ref()
-            .map(|description| format!(" alt=\"{}\"", description))
-            .unwrap_or_default();
-        content = format!(
-            "\n{}<img src=\"{}\"{}>",
-            content, media.preview_url, alt_text
-        );
+        if let Some(preview_url) = &media.preview_url {
+            let alt_text = media
+                .description
+                .as_ref()
+                .map(|description| format!(" alt=\"{}\"", description))
+                .unwrap_or_default();
+            content = format!(
+                "\n{}<img src=\"{}\"{}>",
+                content, preview_url, alt_text
+            );
+        }
     }
 
     content
@@ -774,7 +776,7 @@ mod tests {
 
     fn test_attachment(preview_url: &str, description: Option<&str>) -> MastodonAttachment {
         MastodonAttachment {
-            preview_url: preview_url.into(),
+            preview_url: Some(preview_url.into()),
             description: description.map(|value| value.to_string()),
         }
     }
