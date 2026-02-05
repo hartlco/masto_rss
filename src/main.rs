@@ -207,10 +207,12 @@ async fn fetch_mastodon_timeline(
         })?;
 
     let status = response.status();
+    eprintln!("Mastodon API response status: {}", status);
     let body = response.text().await.map_err(|e| {
         eprintln!("Failed to read Mastodon timeline response: {e}");
         UserError::InternalError
     })?;
+    eprintln!("Mastodon API response body length: {} chars", body.len());
 
     if !status.is_success() {
         let message = mastodon_error_message(&body)
@@ -220,7 +222,10 @@ async fn fetch_mastodon_timeline(
     }
 
     match serde_json::from_str::<Vec<MastodonStatus>>(&body) {
-        Ok(posts) => Ok(posts),
+        Ok(posts) => {
+            eprintln!("Successfully parsed {} Mastodon posts", posts.len());
+            Ok(posts)
+        }
         Err(err) => {
             if let Some(message) = mastodon_error_message(&body) {
                 eprintln!("Mastodon API error payload: {}", message);
