@@ -4,6 +4,9 @@ services:
     image: ghcr.io/hartlco/masto_rss:main
     env_file:
       - .env
+    working_dir: /usr/src
+    volumes:
+      - ./.env:/usr/src/.env:ro
     ports:
       - "6060:6060"
     restart: unless-stopped
